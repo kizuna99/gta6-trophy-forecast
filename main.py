@@ -17,10 +17,13 @@ Two regimes:
     before the target.
   * One frozen snapshot (the launch-night practice): the page is stale
     and a refresh lands before the target. Players grow at an
-    early-launch rate from the snapshot until that refresh; earners are
-    carried across the refresh unchanged (newly tracked players have not
-    registered earns yet), except a trophy every tracked player holds,
-    whose earners track the player count itself.
+    early-launch rate from the snapshot until that refresh, and earners
+    grow too: the tracked cohort keeps playing while the page is frozen,
+    so each count is scaled by an hourly growth prior over the span to
+    the refresh. A trophy every tracked player holds stays at 100%: its
+    earners track the player count itself. The spread is calibrated
+    against a suite of answer scenarios (growth, pool size, shape), not
+    against one assumed answer.
 """
 
 import json
@@ -40,12 +43,24 @@ Z = (-1.6448536269514722, -0.6744897501960817, 0.0,
 # refreshes of a hot launch page, and the hourly growth of the tracked
 # pool in the first hours after release, decaying with the game's age.
 PRIOR_CADENCE_MIN = 280.0
-PRIOR_GROWTH_PER_HOUR = 0.386
+PRIOR_GROWTH_PER_HOUR = 0.404
 PRIOR_GROWTH_DECAY_HOURS = 48.0
 
-SIGMA_STALE = 0.02
+# Earners growth prior for a frozen page: the tracked cohort keeps
+# earning while Exophase shows the stale page. Per hour, compounding
+# over the span from the snapshot to the answering refresh, capped.
+EARNERS_GROWTH_PER_HOUR = 0.029
+EARNERS_GROWTH_CAP = 2.0
+
+SIGMA_STALE = 0.16
 SIGMA_FRESH = 0.05
 SIGMA_PER_SQRT_DAY = 0.10
+
+# General path: log-time basis (hours) for the growth fits, and the
+# pseudo-count at which a trophy's own earners slope is trusted as
+# much as the total-earns slope it is shrunk toward.
+LOGTIME_TAU_HOURS = 6.0
+SHRINK_COUNTS = 25.0
 
 
 def parse_time(text):
@@ -146,6 +161,8 @@ def forecast_stale(snaps, case, at, target, release):
                                               / PRIOR_GROWTH_DECAY_HOURS)
     hours = (refresh_at - anchor).total_seconds() / 3600.0
     players_hat = snap.players * min(50.0, math.exp(growth * hours))
+    earners_scale = min(EARNERS_GROWTH_CAP,
+                        math.exp(EARNERS_GROWTH_PER_HOUR * hours))
     medians = []
     for earners, rate in zip(snap.earners, snap.rates):
         if rate is None:
@@ -153,55 +170,95 @@ def forecast_stale(snaps, case, at, target, release):
         elif earners is not None and earners >= snap.players:
             medians.append(100.0)
         else:
-            medians.append(100.0 * (earners or 0) / players_hat)
+            # Growth saturates as a rate nears 100%: a trophy almost
+            # every tracked player holds has little headroom left.
+            scale_i = 1.0 + (earners_scale - 1.0) * (1.0 - rate / 100.0)
+            e_hat = (earners or 0) * scale_i
+            medians.append(100.0 * min(e_hat, players_hat) / players_hat)
     return medians, SIGMA_STALE
 
 
+def _logtime(hours):
+    """Log-time basis: launch growth is fast early and decays, so equal
+    steps in ln(1 + t/tau) are the natural unit for fitting it."""
+    return math.log(1.0 + hours / LOGTIME_TAU_HOURS)
+
+
+def _slope(xs, ys):
+    n = len(xs)
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    var = sum((x - mx) ** 2 for x in xs)
+    if var <= 0:
+        return 0.0
+    return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / var
+
+
 def forecast_general(snaps, case, at, target, release):
-    """Several snapshots: fit growth, project to the answering refresh."""
-    # Fit on the recent snapshots only: launch-phase growth decays, and
-    # the oldest refreshes say little about the coming days.
-    snaps = snaps[-6:]
+    """Several snapshots: fit growth, project to the answering refresh.
+
+    Pool and earners are fitted against log-time over the recent
+    snapshots (a launch curve bends; a straight line in clock time
+    extrapolated over days would explode). Each trophy's earners get
+    their own fitted slope, shrunk toward the total-earns slope by how
+    much count evidence backs it: a trophy with a handful of earners
+    has a noisy slope, a trophy with hundreds speaks for itself.
+    """
+    snaps = snaps[-12:]
     last = snaps[-1]
-    times = [(s.first - snaps[0].first).total_seconds() / 3600.0
+    hours = [(s.first - snaps[0].first).total_seconds() / 3600.0
              for s in snaps]
-    # Log-linear fit of the tracked pool over snapshot times.
-    n = len(snaps)
-    lp = [math.log(max(1, s.players)) for s in snaps]
-    mt = sum(times) / n
-    mp = sum(lp) / n
-    var = sum((t - mt) ** 2 for t in times)
-    g_players = (sum((t - mt) * (v - mp) for t, v in zip(times, lp)) / var
-                 if var > 0 else 0.0)
-    g_players = max(0.0, min(0.05, g_players))
+    xs = [_logtime(h) for h in hours]
     # Refresh cadence from the gaps between distinct snapshots.
     gaps = [(snaps[i + 1].first - snaps[i].first).total_seconds() / 60.0
-            for i in range(n - 1)]
+            for i in range(len(snaps) - 1)]
     gaps.sort()
     cadence = timedelta(minutes=gaps[len(gaps) // 2]) if gaps \
         else timedelta(minutes=PRIOR_CADENCE_MIN)
     refresh_at = last.first
     while refresh_at + cadence <= target:
         refresh_at += cadence
-    hours = max(0.0, (refresh_at - last.first).total_seconds() / 3600.0)
-    players_hat = last.players * math.exp(g_players * hours)
-    # Earners: scale each count by the growth of total earns, fitted the
-    # same way; a trophy held by everyone tracks the pool itself.
-    le = [math.log(max(1, s.earned_total or 1)) for s in snaps]
-    me = sum(le) / n
-    g_earned = (sum((t - mt) * (v - me) for t, v in zip(times, le)) / var
-                if var > 0 else 0.0)
-    g_earned = max(0.0, min(0.05, g_earned))
-    earned_scale = math.exp(g_earned * hours)
+    proj_hours = (refresh_at - snaps[0].first).total_seconds() / 3600.0
+    dx = _logtime(proj_hours) - xs[-1]
+    # Temper the extrapolation: the fitted window spans xs[-1]-xs[0] of
+    # log-time and the projection reaches dx beyond it. Blend the
+    # projected rate toward the last observed rate by the share of the
+    # total span the data actually covers, so a far projection leans
+    # more on "rates stay" and a short one trusts the fit.
+    span = (xs[-1] - xs[0]) + dx
+    trust = (xs[-1] - xs[0]) / span if span > 0 else 1.0
+    # Pool projection from its log-time slope (never shrinking).
+    pool_slope = max(0.0, _slope(xs, [math.log(max(1, s.players))
+                                      for s in snaps]))
+    players_hat = last.players * math.exp(pool_slope * dx)
+    players_hat = max(float(last.players), players_hat)
+    # Total-earns slope: the shrinkage target for per-trophy slopes.
+    total_slope = max(0.0, _slope(xs, [math.log(max(1, s.earned_total or 1))
+                                       for s in snaps]))
     medians = []
-    for earners, rate in zip(last.earners, last.rates):
+    for j, (earners, rate) in enumerate(zip(last.earners, last.rates)):
         if rate is None:
             medians.append(0.01)
         elif earners is not None and earners >= last.players:
             medians.append(100.0)
         else:
-            e_hat = (earners or 0) * earned_scale
-            medians.append(100.0 * min(e_hat, players_hat) / players_hat)
+            series = [s.earners[j] for s in snaps]
+            if all(v is not None for v in series):
+                raw = _slope(xs, [math.log(v + 0.5) for v in series])
+                mean_e = sum(series) / len(series)
+                w = mean_e / (mean_e + SHRINK_COUNTS)
+                slope_i = w * raw + (1.0 - w) * total_slope
+            else:
+                slope_i = total_slope
+            slope_i = max(0.0, slope_i)
+            e_hat = (earners or 0) * math.exp(slope_i * dx)
+            projected = 100.0 * min(e_hat, players_hat) / players_hat
+            if 0.0 < rate < 100.0 and projected > 0.0:
+                blended = math.exp((1.0 - trust) * math.log(rate)
+                                   + trust * math.log(projected))
+                medians.append(blended)
+            else:
+                medians.append(projected)
     days = max(0.0, (refresh_at - last.first).total_seconds() / 86400.0)
     sigma = SIGMA_FRESH + SIGMA_PER_SQRT_DAY * math.sqrt(days)
     return medians, sigma
@@ -221,7 +278,15 @@ def forecast_case(case):
         # The page prints 2 decimals and the printed value is what is
         # scored, so centre the forecast on the printed grid.
         median = round(min(100.0, max(0.0, median)), 2)
-        rows.append({"id": trophy["id"], "q": quantile_row(median, sigma)})
+        # A multiplicative shock to the rate moves its logit by about
+        # 1 / (1 - rate) times the log shock, so widen the spread for
+        # mid-range trophies; a rate pinned at the top barely moves.
+        if median >= 99.9:
+            sigma_i = sigma
+        else:
+            sigma_i = sigma * min(2.5, 1.0 / (1.0 - median / 100.0))
+        rows.append({"id": trophy["id"],
+                     "q": quantile_row(median, sigma_i)})
     return {"trophies": rows}
 
 
